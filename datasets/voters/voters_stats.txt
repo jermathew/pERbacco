@@ -1,0 +1,4 @@
+Number of blocks 9845
+After cleaning and purging
+Recall 0.9919543741725226Precision 0.007969092358016792Number of comparisons 1222222After meta-blocking
+Recall 0.9188308381708932Precision 0.010214120665197156Number of comparisons 883287
