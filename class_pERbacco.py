@@ -63,7 +63,22 @@ def r_rec_k(x, k):
         x_prime = x % k  # Remainder for x'
         return r_rec_k(n + x_prime, k)
 
-def read_graph(dname, synth_precision = "False"):
+def read_graph(dname, synth_precision="False", return_mapping=False):
+    """Load the similarity graph and ground-truth matches for *dname*.
+
+    Args:
+        dname:           Dataset name (e.g. "cora", "camera").
+        synth_precision: Precision parameter for synthetic datasets, or "False".
+        return_mapping:  If True, also return the node-ID remapping dict
+                         ``dict_inv`` (original ID → compacted ID).  This is
+                         needed when the LLM oracle must look up record data by
+                         graph node ID.  When no remapping was necessary,
+                         ``dict_inv`` is ``None``.
+
+    Returns:
+        ``(g, graph)`` when *return_mapping* is False (default).
+        ``(g, graph, dict_inv)`` when *return_mapping* is True.
+    """
 
     g = pd.read_csv(f'datasets/{dname}/groundtruth.csv')
     g.columns.values[0] = 'id1'
@@ -94,6 +109,7 @@ def read_graph(dname, synth_precision = "False"):
 
     # Necessary step if the ids are not [1,k] but they are anonymized (random values in [1 ,10^10])
 
+    dict_inv = None
     set_nodes = set(graph.nodes())
     if len(set_nodes)  < max(set_nodes):
         #Different range!
@@ -110,6 +126,8 @@ def read_graph(dname, synth_precision = "False"):
 
     print(dname, "nodes, matches, edges", len(set_nodes), len(g), len(graph.edges()))
 
+    if return_mapping:
+        return (g, graph, dict_inv)
     return(g, graph)
 
 def synthetic_dataset (number_entities, size_max, recall, precision, seed = 0):
@@ -182,7 +200,26 @@ def synthetic_dataset (number_entities, size_max, recall, precision, seed = 0):
 
 
 class class_entity:
-    def __init__(self, dname, graph, df_ground_truth, batch_size, alg_community, mu_benefit, lambda_w):
+    def __init__(self, dname, graph, df_ground_truth, batch_size, alg_community, mu_benefit, lambda_w, oracle=None):
+        """Initialise the entity-resolution state.
+
+        Args:
+            dname:            Dataset name (used for logging / saving results).
+            graph:            NetworkX similarity graph.
+            df_ground_truth:  DataFrame with columns [id1, id2] listing all
+                              ground-truth matching pairs.  Still used for
+                              recall computation and community analysis.
+            batch_size:       Number of records per oracle query.
+            alg_community:    Community-detection algorithm ("louvain", "leiden",
+                              "lpa", "infomap", "False").
+            mu_benefit:       Benefit function ("brspecial", "brmean", "brmax").
+            lambda_w:         Density threshold for heavy communities, or "False".
+            oracle:           An instance of :class:`oracle.BaseOracle` (or any
+                              object implementing ``query_batch``).  When *None*,
+                              the ground-truth dictionary is used directly as a
+                              fallback so that the class remains usable without
+                              importing oracle.py.
+        """
 
         #graph_copy = copy.deepcopy(graph)
         self.dname = dname
@@ -195,6 +232,10 @@ class class_entity:
         self.alg_community = alg_community
         self.mu_benefit = mu_benefit
         self.lambda_w = lambda_w
+
+        # Oracle used for match/non-match decisions in query().
+        # Can be set / replaced at any time before the first call to query().
+        self.oracle = oracle
 
         self.dict_entity = dict()
         self.dict_entity_belonging = dict()
@@ -336,8 +377,32 @@ class class_entity:
 
         if type_query in ["entity", "batch"]:
 
-            for (x,y) in itertools.combinations(set_query, 2):
+            # ── Oracle query ──────────────────────────────────────────────── #
+            # Ask the oracle once for the *entire* batch.  This is the key
+            # abstraction point: swapping self.oracle replaces the ground-truth
+            # lookup with any other decision procedure (e.g. an LLM).
+            #
+            # oracle_decisions maps (min_id, max_id) → bool for every pair of
+            # original records in set_query.  We index by the *original* record
+            # IDs (x, y) rather than the cluster representatives (u, v) so that
+            # the LLM oracle can use actual record content.  For the ground-truth
+            # oracle the result is identical because the ground truth is an
+            # equivalence relation (transitive), so representative ↔ member
+            # membership is preserved.
+            if self.oracle is not None:
+                oracle_decisions = self.oracle.query_batch(list(set_query))
+            else:
+                # Fallback: use dict_ground_truth directly (backward-compatible
+                # behaviour when no oracle has been set).
+                oracle_decisions = {
+                    (min(x, y), max(x, y)): x in self.dict_ground_truth.get(y, set())
+                    for x, y in itertools.combinations(set_query, 2)
+                }
 
+            for (x,y) in itertools.combinations(set_query, 2):
+                # Keep a reference to the original record IDs *before* any
+                # possible (x, y) swap below so the oracle-decision key is stable.
+                orig_x, orig_y = x, y
 
                 u = self.dict_entity_belonging[x]
                 v = self.dict_entity_belonging[y]
@@ -369,9 +434,11 @@ class class_entity:
                             #prob_uv = self.df_benefit.loc[uv_row, "prob"]
                             benefit_uv = self.df_benefit.loc[uv_row, "benefit"]
 
-                    # match-case
-
-                    if u in self.dict_ground_truth[v]:
+                    # ── Match decision via oracle ─────────────────────────── #
+                    # Look up the pre-computed oracle decision for this pair
+                    # using the *original* (pre-swap) record IDs.
+                    oracle_key = (min(orig_x, orig_y), max(orig_x, orig_y))
+                    if oracle_decisions.get(oracle_key, False):
 
                         # merge u and v into u, then delete v
                         self.dict_entity[u] = {"set_entity" : self.dict_entity[u]["set_entity"] | self.dict_entity[v]["set_entity"], 

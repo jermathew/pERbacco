@@ -47,6 +47,10 @@ if (True):
     import concurrent.futures
     import time
 
+# ── Module imports (classes / helpers defined in companion files) ──────────── #
+from class_pERbacco import class_entity, read_graph, q_rec_k, r_rec_k, synthetic_dataset
+from oracle import GroundTruthOracle, LLMOracle
+
 # INPUT
 
 if __name__ == "__main__":
@@ -62,7 +66,21 @@ if __name__ == "__main__":
 
     #synthetic
     parser.add_argument('--synth_precision')
-    
+
+    # oracle: "ground_truth" uses annotated labels (default, paper experiments);
+    #         "llm" queries an OpenAI model — requires OPENAI_API_KEY in .env
+    parser.add_argument(
+        '--oracle',
+        type=str,
+        choices=["ground_truth", "llm"],
+        default="ground_truth",
+        help=(
+            'Oracle to use for match/non-match decisions. '
+            '"ground_truth" (default) uses annotated labels. '
+            '"llm" queries an OpenAI chat model; requires OPENAI_API_KEY.'
+        ),
+    )
+
     args = parser.parse_args()
 
 
@@ -77,22 +95,86 @@ if __name__ == "__main__":
     # optimal
     optimal = args.optimal
 
-
-
     #synthetic
     synth_precision = args.synth_precision
-        
+
     if synth_precision != "False":
         synth_precision = float(synth_precision)
-    
+
+    # ── Oracle configuration ───────────────────────────────────────────────── #
+    oracle_type = args.oracle
+
+    # Load .env (sets OPENAI_API_KEY etc. if the file exists — silently skipped
+    # when the file is absent so the ground-truth oracle still works without it).
+    try:
+        from dotenv import load_dotenv
+        load_dotenv()
+    except ImportError:
+        pass  # python-dotenv is optional when using the ground-truth oracle
+
+    # Load config.yaml for LLM settings (model name, retries, …).
+    _oracle_cfg = {}
+    try:
+        import yaml as _yaml
+        if os.path.exists("config.yaml"):
+            with open("config.yaml") as _f:
+                _full_cfg = _yaml.safe_load(_f) or {}
+                _oracle_cfg = _full_cfg.get("oracle", {})
+    except ImportError:
+        pass  # pyyaml is optional; defaults are used if config.yaml cannot be read
+
+    llm_model       = _oracle_cfg.get("llm_model", "gpt-4o-mini")
+    llm_max_retries = int(_oracle_cfg.get("llm_max_retries", 3))
+    openai_api_key  = os.environ.get("OPENAI_API_KEY")
+
 
 k_minimum_queries = 3
+
+
+# ── Helper: load record data for the LLM oracle ───────────────────────────── #
+def _load_record_data(dname, node_mapping=None):
+    """Return a dict mapping graph node ID → attribute dict for each record.
+
+    Args:
+        dname:        Dataset name.  Looks for ``datasets/{dname}/{dname}.csv``.
+        node_mapping: The ``dict_inv`` returned by ``read_graph(…, return_mapping=True)``.
+                      When node IDs were remapped (i.e. when the original IDs are
+                      not a compact range starting at 0), this mapping is applied
+                      so the returned dict is keyed by the same integer IDs used
+                      in the similarity graph.  Pass ``None`` if no remapping
+                      occurred.
+
+    Returns:
+        ``{graph_node_id: {col: value, …}}`` or ``{}`` if the CSV is absent.
+    """
+    csv_path = os.path.join("datasets", dname, f"{dname}.csv")
+    if not os.path.exists(csv_path):
+        print(f"[LLMOracle] Record data file not found: {csv_path} — prompts will be empty.")
+        return {}
+
+    df = pd.read_csv(csv_path)
+
+    # Normalise the record-ID column to 'id'
+    if 'id' not in df.columns:
+        df = df.reset_index().rename(columns={'index': 'id'})
+
+    record_data = df.set_index('id').to_dict(orient='index')
+
+    # Apply node-ID remapping if necessary
+    if node_mapping is not None:
+        record_data = {
+            node_mapping[orig_id]: attrs
+            for orig_id, attrs in record_data.items()
+            if orig_id in node_mapping
+        }
+
+    return record_data
 
 
 # COMPUTE max_query
 if (True):
     # COMPUTE THE LOWER BOUND FOR THE MINIMUM NUMBER OF QUERIES
-    g, graph = read_graph(dname, synth_precision)
+    g, graph, _node_mapping = read_graph(dname, synth_precision, return_mapping=True)
   
 
 
@@ -159,8 +241,27 @@ if (True):
     else:
         #g, graph = read_graph(dname, synth_precision)
         perbacco = class_entity(dname, graph, g, batch_size, alg_community, mu_benefit, lambda_w)
-    
 
+    # ── Attach the oracle ────────────────────────────────────────────────── #
+    # The oracle is set here (after class_entity is initialised) because
+    # GroundTruthOracle needs perbacco.dict_ground_truth which is built in
+    # class_entity.__init__.
+    if oracle_type == "ground_truth":
+        perbacco.oracle = GroundTruthOracle(perbacco.dict_ground_truth)
+    elif oracle_type == "llm":
+        if not openai_api_key:
+            raise ValueError(
+                "oracle_type='llm' requires an OpenAI API key.  "
+                "Set OPENAI_API_KEY in your environment or in a .env file."
+            )
+        record_data = _load_record_data(dname, node_mapping=_node_mapping)
+        perbacco.oracle = LLMOracle(
+            model=llm_model,
+            api_key=openai_api_key,
+            record_data=record_data,
+            max_retries=llm_max_retries,
+        )
+    print(f"Oracle: {oracle_type}" + (f" ({llm_model})" if oracle_type == "llm" else ""))
 
 
     perbacco.create_list_community()

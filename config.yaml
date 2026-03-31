@@ -1,0 +1,20 @@
+# pERbacco configuration
+# ─────────────────────────────────────────────────────────────────────────────
+# oracle.type
+#   Which oracle to use for match/non-match decisions.
+#   "ground_truth"  — use pre-annotated ground-truth labels (default).
+#                     Replicates the original paper experiments; no API key needed.
+#   "llm"           — query an OpenAI chat model with the full batch of records.
+#                     Requires OPENAI_API_KEY to be set (in .env or environment).
+#
+# oracle.llm_model
+#   OpenAI model name. Only used when oracle.type = "llm".
+#
+# oracle.llm_max_retries
+#   Number of times to retry the OpenAI API on transient errors.
+# ─────────────────────────────────────────────────────────────────────────────
+
+oracle:
+  type: "ground_truth"
+  llm_model: "gpt-4o-mini"
+  llm_max_retries: 3
