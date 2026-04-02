@@ -1,0 +1,20 @@
+template: |
+  You are an expert in entity resolution.
+
+  Your task is to group the following records by the real-world entity they describe.
+  Records that refer to the same real-world entity belong in the same group.
+  Records that do not match any other record form a group of one.
+  Every record must appear in exactly one group.
+
+  Records:
+  {records}
+
+  Return ONLY a JSON array of groups, where each group is an array of record IDs.
+  Do not include any explanation or commentary — JSON only.
+
+  For example, if records 1, 3 and 7 refer to the same entity, record 2 is unique,
+  and records 4 and 5 refer to the same entity, return:
+
+  [[1, 3, 7], [2], [4, 5]]
+
+  Answer:

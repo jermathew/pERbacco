@@ -116,8 +116,8 @@ if __name__ == "__main__":
     _oracle_cfg = {}
     try:
         import yaml as _yaml
-        if os.path.exists("config.yaml"):
-            with open("config.yaml") as _f:
+        if os.path.exists("config/config.yaml"):
+            with open("config/config.yaml") as _f:
                 _full_cfg = _yaml.safe_load(_f) or {}
                 _oracle_cfg = _full_cfg.get("oracle", {})
     except ImportError:
@@ -254,7 +254,18 @@ if (True):
                 "oracle_type='llm' requires an OpenAI API key.  "
                 "Set OPENAI_API_KEY in your environment or in a .env file."
             )
+        if "synth" in dname:
+            raise ValueError(
+                f"oracle_type='llm' is not supported for synthetic datasets ('{dname}'): "
+                "synthetic records have no textual attributes for the LLM to reason about."
+            )
         record_data = _load_record_data(dname, node_mapping=_node_mapping)
+        if not record_data:
+            raise ValueError(
+                f"No record data found for dataset '{dname}' "
+                f"(expected datasets/{dname}/{dname}.csv).  "
+                "The LLM oracle needs record attributes to reason about."
+            )
         perbacco.oracle = LLMOracle(
             model=llm_model,
             api_key=openai_api_key,

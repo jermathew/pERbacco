@@ -39,6 +39,7 @@ import itertools
 import json
 import re
 from abc import ABC, abstractmethod
+from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 
@@ -101,10 +102,18 @@ class GroundTruthOracle(BaseOracle):
 class LLMOracle(BaseOracle):
     """Oracle that queries an OpenAI chat model to decide whether records match.
 
-    The entire batch of records is sent in a single prompt so the model can
-    exploit cross-record context — matching the "batched oracle" spirit of the
-    paper.  The model is expected to return a JSON array of ``[id1, id2]`` pairs
-    representing duplicates.
+    The entire batch of records is sent in a single prompt.  The model is asked
+    to return a *clustering* of the records — an array of groups where each group
+    contains IDs that refer to the same real-world entity.  This is more natural
+    than asking for pairs and guarantees that the model's output is transitively
+    consistent within each group (if A and B are in the same group, and B and C
+    are in the same group, A and C are implicitly matched too).
+
+    The clustering is then converted internally to a ``{(u, v): bool}`` dict so
+    the rest of the codebase does not need to change.
+
+    The prompt template is loaded from ``config/prompts/llm_oracle.txt`` (relative
+    to this file).  Edit that file to customise the prompt without touching code.
 
     Args:
         model:        OpenAI model name, e.g. ``"gpt-4o-mini"`` or ``"gpt-4o"``.
@@ -115,6 +124,9 @@ class LLMOracle(BaseOracle):
                       the similarity graph.
         max_retries:  How many times to retry on transient API errors.
     """
+
+    # Default template path, relative to this source file
+    _DEFAULT_TEMPLATE_PATH = Path(__file__).parent / "config" / "llm_oracle.yaml"
 
     def __init__(
         self,
@@ -135,8 +147,47 @@ class LLMOracle(BaseOracle):
         self.client = OpenAI(api_key=api_key)
         self.record_data = record_data
         self.max_retries = max_retries
+        self._prompt_template = self._load_prompt_template()
 
     # ── Prompt construction ───────────────────────────────────────────────── #
+
+    @classmethod
+    def _load_prompt_template(cls) -> str:
+        """Load the prompt template from ``config/prompts/llm_oracle.yaml``.
+
+        The YAML file is expected to have a single ``template`` key whose value
+        is the prompt string (with a ``{records}`` placeholder).  Falls back to
+        an inline copy of the same text if the file is missing or pyyaml is not
+        installed.
+        """
+        if cls._DEFAULT_TEMPLATE_PATH.exists():
+            try:
+                import yaml
+                data = yaml.safe_load(cls._DEFAULT_TEMPLATE_PATH.read_text())
+                return data["template"]
+            except Exception as exc:
+                print(f"[LLMOracle] Could not load prompt template: {exc} — using inline fallback.")
+
+        print(
+            f"[LLMOracle] Prompt template not found at "
+            f"{cls._DEFAULT_TEMPLATE_PATH} — using inline fallback."
+        )
+        return (
+            "You are an expert in entity resolution.\n\n"
+            "Your task is to group the following records by the real-world entity "
+            "they describe.\n"
+            "Records that refer to the same real-world entity belong in the same group.\n"
+            "Records that do not match any other record form a group of one.\n"
+            "Every record must appear in exactly one group.\n\n"
+            "Records:\n{records}\n\n"
+            "Return ONLY a JSON array of groups, where each group is an array of "
+            "record IDs.\n"
+            "Do not include any explanation or commentary — JSON only.\n\n"
+            "For example, if records 1, 3 and 7 refer to the same entity, record 2 "
+            "is unique,\nand records 4 and 5 refer to the same entity, return:\n\n"
+            "[[1, 3, 7], [2], [4, 5]]\n\n"
+            "Answer:"
+        )
 
     def _format_record(self, record_id: int) -> str:
         record = self.record_data.get(record_id, {})
@@ -144,55 +195,47 @@ class LLMOracle(BaseOracle):
         return f"[{record_id}] {attrs}"
 
     def _build_prompt(self, batch: List[int]) -> str:
-        """Build the prompt sent to the LLM.
-
-        NOTE: This is a minimal placeholder prompt.  For production use, tailor
-        the prompt to your dataset's schema and add few-shot examples.
-        """
+        """Fill the prompt template with the formatted records for this batch."""
         records_block = "\n".join(self._format_record(r) for r in batch)
-        prompt = (
-            "You are an expert in entity resolution.\n"
-            "Below is a list of records.  Your task is to identify which pairs of "
-            "records refer to the same real-world entity.\n\n"
-            f"Records:\n{records_block}\n\n"
-            "Return ONLY a JSON array of [id1, id2] pairs where the two records are "
-            "duplicates of each other.  If there are no duplicates, return an empty "
-            "array [].  Do not include any explanation — JSON only.\n\n"
-            "Answer:"
-        )
-        return prompt
+        return self._prompt_template.replace("{records}", records_block)
 
     # ── Response parsing ──────────────────────────────────────────────────── #
 
     def _parse_response(
         self, text: str, batch: List[int]
     ) -> Dict[Tuple[int, int], bool]:
-        """Parse the LLM's JSON response into a match-decision dictionary."""
+        """Parse a cluster-based JSON response into a match-decision dictionary.
+
+        The LLM returns an array of groups, e.g. ``[[1, 3], [2], [4, 5]]``.
+        All pairs *within* the same group are marked True; all pairs *across*
+        groups are marked False.  Records omitted from the response (the LLM
+        forgot to list a singleton) are treated as unmatched.
+        """
         # Initialise all pairs as non-matches
         results: Dict[Tuple[int, int], bool] = {
             (min(x, y), max(x, y)): False
             for x, y in itertools.combinations(batch, 2)
         }
 
-        # Extract the first JSON array from the response text
+        # Extract the outermost JSON array from the response
         match = re.search(r"\[.*\]", text, re.DOTALL)
         if not match:
             print(f"[LLMOracle] Could not find a JSON array in response: {text[:200]!r}")
             return results
 
+        batch_set = set(batch)
         try:
-            pairs = json.loads(match.group())
-            for pair in pairs:
-                if isinstance(pair, (list, tuple)) and len(pair) == 2:
-                    u, v = int(pair[0]), int(pair[1])
+            clusters = json.loads(match.group())
+            for cluster in clusters:
+                if not isinstance(cluster, list):
+                    continue
+                # Keep only IDs that actually belong to the current batch
+                valid_ids = [int(rid) for rid in cluster if int(rid) in batch_set]
+                # Every pair within this cluster is a match
+                for u, v in itertools.combinations(valid_ids, 2):
                     key = (min(u, v), max(u, v))
                     if key in results:
                         results[key] = True
-                    else:
-                        print(
-                            f"[LLMOracle] Pair {key} returned by LLM is not in the "
-                            "current batch — ignored."
-                        )
         except (json.JSONDecodeError, ValueError, TypeError) as exc:
             print(f"[LLMOracle] Failed to parse response: {exc}\nRaw: {text[:300]!r}")
 
